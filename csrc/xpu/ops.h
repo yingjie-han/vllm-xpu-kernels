@@ -346,3 +346,23 @@ void deepseek_fused_indexer_q_rope_mxfp4(
     torch::Tensor& packed_out,
     torch::Tensor& scales_out,
     torch::Tensor& weights_out);
+
+void fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
+    const torch::Tensor& state_cache,
+    const torch::Tensor& token_to_req_indices,
+    const torch::Tensor& positions,
+    const torch::Tensor& slot_mapping,
+    const torch::Tensor& block_table,
+    int64_t block_size,
+    int64_t state_width,
+    const torch::Tensor& rms_norm_weight,
+    double rms_norm_eps,
+    const torch::Tensor& cos_sin_cache,
+    torch::Tensor& kv_cache,
+    const torch::Tensor& kv_slot_mapping,
+    int64_t kv_cache_block_size,
+    int64_t head_dim,
+    int64_t rope_head_dim,
+    int64_t compress_ratio,
+    int64_t overlap,
+    int64_t quant_block);
