@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "dispatch_utils.h"
@@ -417,6 +418,97 @@ class concat_and_cache_mla_kernel {
   const int pe_dim;                          //
   const int block_size;                      //
   const float* scale;                        //
+};
+
+template <typename scalar_t>
+class concat_and_cache_ds_mla_kernel {
+ public:
+  concat_and_cache_ds_mla_kernel(
+      const scalar_t* __restrict__ kv_c,
+      const scalar_t* __restrict__ k_pe,
+      uint8_t* __restrict__ kv_cache,
+      const int64_t* __restrict__ slot_mapping,
+      int block_stride,
+      int entry_stride,
+      int kv_c_stride,
+      int k_pe_stride,
+      int block_size)
+      : kv_c_(kv_c),
+        k_pe_(k_pe),
+        kv_cache_(kv_cache),
+        slot_mapping_(slot_mapping),
+        block_stride_(block_stride),
+        entry_stride_(entry_stride),
+        kv_c_stride_(kv_c_stride),
+        k_pe_stride_(k_pe_stride),
+        block_size_(block_size) {}
+
+  [[sycl::reqd_sub_group_size(16)]]
+  void operator()(const sycl::nd_item<1>& item) const {
+    constexpr int kNopeDim = 512;
+    constexpr int kQuantGroupSize = 128;
+    constexpr int kNumScales = kNopeDim / kQuantGroupSize;
+    constexpr int kScaleOffset = kNopeDim;
+    constexpr int kRopeOffset = kScaleOffset + kNumScales * sizeof(float);
+
+    const int64_t token_idx = item.get_group(0);
+    const int64_t slot_idx = slot_mapping_[token_idx];
+    if (slot_idx < 0) return;
+
+    const int block_idx = slot_idx / block_size_;
+    const int block_offset = slot_idx % block_size_;
+    uint8_t* dst =
+        kv_cache_ + block_idx * block_stride_ + block_offset * entry_stride_;
+
+    const int local_idx = item.get_local_id(0);
+    const int group_idx = local_idx / 16;
+    const int lane_idx = local_idx % 16;
+    const int src_offset = group_idx * kQuantGroupSize + lane_idx * 8;
+    const scalar_t* src = kv_c_ + token_idx * kv_c_stride_ + src_offset;
+
+    float values[8];
+    float local_max = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      values[i] = static_cast<float>(src[i]);
+      local_max = sycl::fmax(local_max, sycl::fabs(values[i]));
+    }
+    const auto subgroup = item.get_sub_group();
+    const float max_abs =
+        sycl::reduce_over_group(subgroup, local_max, sycl::maximum<float>());
+    const float tile_scale = sycl::fmax(
+        max_abs / kFp8E4M3ScaleDivisor, std::numeric_limits<float>::min());
+
+    if (lane_idx == 0) {
+      *reinterpret_cast<float*>(
+          dst + kScaleOffset + group_idx * sizeof(float)) = tile_scale;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const auto fp8_value =
+          static_cast<at::Float8_e4m3fn>(values[i] / tile_scale);
+      dst[src_offset + i] = sycl::bit_cast<uint8_t>(fp8_value);
+    }
+
+    if (local_idx < 32) {
+      const int rope_offset = local_idx * 2;
+      const scalar_t* rope_src = k_pe_ + token_idx * k_pe_stride_ + rope_offset;
+      scalar_t* rope_dst = reinterpret_cast<scalar_t*>(dst + kRopeOffset);
+      rope_dst[rope_offset] = rope_src[0];
+      rope_dst[rope_offset + 1] = rope_src[1];
+    }
+  }
+
+ private:
+  const scalar_t* __restrict__ kv_c_;
+  const scalar_t* __restrict__ k_pe_;
+  uint8_t* __restrict__ kv_cache_;
+  const int64_t* __restrict__ slot_mapping_;
+  int block_stride_;
+  int entry_stride_;
+  int kv_c_stride_;
+  int k_pe_stride_;
+  int block_size_;
 };
 
 // grid is launched with dimensions (batch, num_splits)
@@ -1179,7 +1271,23 @@ void concat_and_cache_mla(
   int pe_dim = k_pe.size(1);
   int block_size = kv_cache.size(1);
 
-  TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
+  const bool use_ds_mla_fp8 = kv_cache_dtype == "fp8_ds_mla";
+  if (use_ds_mla_fp8) {
+    TORCH_CHECK(kv_lora_rank == 512, "kv_lora_rank must be 512 for fp8_ds_mla");
+    TORCH_CHECK(pe_dim == 64, "pe_dim must be 64 for fp8_ds_mla");
+    TORCH_CHECK(
+        kv_cache.scalar_type() == torch::kUInt8,
+        "kv_cache must be uint8 for fp8_ds_mla");
+    TORCH_CHECK(
+        kv_cache.size(2) == 656,
+        "kv_cache.size(2) must be 656 bytes for fp8_ds_mla");
+    TORCH_CHECK(
+        kv_c.scalar_type() == torch::kBFloat16 &&
+            k_pe.scalar_type() == torch::kBFloat16,
+        "kv_c and k_pe must be bfloat16 for fp8_ds_mla");
+  } else {
+    TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
+  }
 
   int kv_c_stride = kv_c.stride(0);
   int k_pe_stride = k_pe.stride(0);
@@ -1190,6 +1298,25 @@ void concat_and_cache_mla(
   sycl::range<1> block(std::min(kv_lora_rank, 1024));
   const at::DeviceGuard device_guard(kv_c.device());
   auto& queue = vllm::xpu::vllmGetQueue();
+
+  if (use_ds_mla_fp8) {
+    sycl::range<1> ds_block(64);
+    queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for(
+          sycl::nd_range<1>(grid * ds_block, ds_block),
+          vllm::concat_and_cache_ds_mla_kernel<at::BFloat16>(
+              reinterpret_cast<at::BFloat16*>(kv_c.data_ptr()),
+              reinterpret_cast<at::BFloat16*>(k_pe.data_ptr()),
+              reinterpret_cast<uint8_t*>(kv_cache.data_ptr()),
+              slot_mapping.data_ptr<int64_t>(),
+              block_stride,
+              entry_stride,
+              kv_c_stride,
+              k_pe_stride,
+              block_size));
+    });
+    return;
+  }
 
   DISPATCH_BY_KV_CACHE_DTYPE(
       kv_c.scalar_type(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA);

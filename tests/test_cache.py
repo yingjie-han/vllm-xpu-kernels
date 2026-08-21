@@ -483,6 +483,55 @@ def test_concat_and_cache_mla(
     else:
         torch.testing.assert_close(kv_cache, ref_kv_cache)
 
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_concat_and_cache_mla_fp8_ds_mla(device: str) -> None:
+    torch.manual_seed(0)
+    num_tokens, num_blocks, block_size = 3, 2, 4
+    kv_c = torch.randn(
+        num_tokens, 512, dtype=torch.bfloat16, device=device
+    )
+    k_pe = torch.randn(num_tokens, 64, dtype=torch.bfloat16, device=device)
+    slot_mapping = torch.tensor([0, 5, -1], dtype=torch.long, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, 656, dtype=torch.uint8, device=device
+    )
+    unused_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    ops.concat_and_cache_mla(
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        "fp8_ds_mla",
+        unused_scale,
+    )
+
+    for token_idx, slot in enumerate([0, 5]):
+        block_idx, block_offset = divmod(slot, block_size)
+        packed = kv_cache[block_idx, block_offset]
+        nope_groups = kv_c[token_idx].float().view(4, 128)
+        scales = torch.clamp(
+            nope_groups.abs().amax(dim=1) / 448.0,
+            min=torch.finfo(torch.float32).tiny,
+        )
+        expected_nope = (nope_groups / scales[:, None]).to(
+            torch.float8_e4m3fn
+        )
+
+        torch.testing.assert_close(
+            packed[:512], expected_nope.view(torch.uint8).reshape(-1)
+        )
+        torch.testing.assert_close(
+            packed[512:528].view(torch.float32), scales
+        )
+        torch.testing.assert_close(
+            packed[528:].view(torch.bfloat16), k_pe[token_idx]
+        )
+
+    assert torch.count_nonzero(kv_cache[0, 1:]).item() == 0
+
 def _reference_dequantize_and_gather_k_cache(
     k_cache: torch.Tensor,
     seq_lens: torch.Tensor,
